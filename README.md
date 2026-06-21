@@ -13,11 +13,11 @@
 ## 💻 사용 방법
 
 ### 1. 파이썬 데이터 수집 환경 세팅
-KRX(한국거래소)에서 전 종목 등락률 데이터를 안정적으로 수집하기 위한 세팅입니다.
+네이버 금융에서 KOSPI/KOSDAQ 전 종목 등락률 데이터를 스크래핑하기 위한 가벼운 세팅입니다. (numpy 의존성 제거)
 
 ```bash
-# 필수 라이브러리 설치 (numpy 버전 충돌 방지)
-pip install "numpy<2" pykrx pandas
+# 필수 라이브러리 설치
+pip install requests beautifulsoup4
 ```
 
 ### 2. 시장 데이터 추출
