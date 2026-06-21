@@ -5,10 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>머니메이커스 · 시황 데스크</title>
 <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
-<link rel="stylesheet" as="style" crossorigin
-  href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css" />
+<link rel="stylesheet" as="style" crossorigin href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css" />
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
+<script src="config.js" onerror="console.log('Local config.js not found, skipping.')"></script>
 <style>
   :root {
     --bg-1: #0A0C10;
@@ -597,10 +597,14 @@ const store = {
 function init() {
   document.getElementById('dateInput').value = new Date().toISOString().slice(0, 10);
   
-  const savedKey = store.get('apiKey');
-  if(savedKey) document.getElementById('apiKey').value = savedKey;
+  if (typeof CONFIG !== 'undefined' && CONFIG.GEMINI_API_KEY) {
+    document.getElementById('apiKey').value = CONFIG.GEMINI_API_KEY;
+  } else {
+    const savedKey = store.get('apiKey');
+    if(savedKey) document.getElementById('apiKey').value = savedKey;
+  }
   
-  const savedModel = store.get('model');
+  const savedModel = store.get('modelSelect');
   if(savedModel) document.getElementById('modelSelect').value = savedModel;
 
   const fields = ['kospi', 'kosdaq', 'news', 'movers', 'signal'];
@@ -655,51 +659,83 @@ function buildUserPrompt() {
   return prompt;
 }
 
-function validateReportData(jsonData, userInput) {
-  const result = { total: 0, passed: 0, warnings: [], formatWarning: false };
-  if (!jsonData.stock_analyses || !Array.isArray(jsonData.stock_analyses)) return result;
-
+function parseMoverRows(userInput) {
   const userStocks = new Map();
-  if (userInput) {
-    const lines = userInput.split('\n');
-    const regex = /^\s*\d+\.\s+([^\s]+)\s*\(\s*(KOSPI|KOSDAQ)\s*\)\s*([-+]\d+\.\d+%)/;
-    for (const line of lines) {
-      const match = line.match(regex);
-      if (match) {
-        userStocks.set(match[1], match[3]);
+  if (!userInput) return userStocks;
+
+  const lines = userInput.split('\n');
+  const moverRegex = /^\s*\d+\.\s+(.+?)\s*\(\s*(KOSPI|KOSDAQ)\s*\)\s*([+-]?\s*\d+(?:\.\d+)?)\s*%/;
+
+  for (const line of lines) {
+    const match = line.match(moverRegex);
+    if (match) {
+      const name = match[1].trim();
+      const market = match[2].trim();
+      const changeString = match[3].replace(/\s+/g, '');
+      const changeNumber = parseFloat(changeString);
+      
+      if (!isNaN(changeNumber)) {
+        userStocks.set(name, { name, market, changeNumber });
       }
     }
-    if (userStocks.size === 0 && userInput.trim() !== '') {
-      result.formatWarning = true;
-    }
+  }
+  return userStocks;
+}
+
+function normalizeChangeRate(changeStr) {
+  if (!changeStr) return null;
+  const num = parseFloat(changeStr.replace(/[^\d.-]/g, ''));
+  return isNaN(num) ? null : num;
+}
+
+function validateReportData(jsonData, userInput, allEvidenceInput) {
+  const result = { total: 0, passedStocks: [], excludedStocks: [], formatWarning: false };
+  if (!jsonData.stock_analyses || !Array.isArray(jsonData.stock_analyses)) return result;
+
+  const userStocks = parseMoverRows(userInput);
+  if (userStocks.size === 0 && userInput.trim() !== '') {
+    result.formatWarning = true;
   }
 
   const stocks = jsonData.stock_analyses;
   result.total = stocks.length;
   const seenNames = new Set();
-  const validStocks = [];
   
-  stocks.forEach((stock) => {
+  for (const stock of stocks) {
+    if (result.passedStocks.length >= 20) {
+      result.excludedStocks.push({ name: stock.name, reason: "20개 종목 제한 초과" });
+      continue;
+    }
+
     let passed = true;
+    let reason = "";
     
     if (stock.market !== 'KOSPI' && stock.market !== 'KOSDAQ') {
-      result.warnings.push(`[${stock.name}] 시장구분 오류`);
+      reason = "KOSPI/KOSDAQ 외 시장";
       passed = false;
-    }
-    
-    if (seenNames.has(stock.name)) {
-      result.warnings.push(`[${stock.name}] 중복`);
+    } else if (seenNames.has(stock.name)) {
+      reason = "중복 종목";
       passed = false;
-    }
-    seenNames.add(stock.name);
-    
-    if (userStocks.size > 0 && !result.formatWarning) {
-      if (!userStocks.has(stock.name)) {
-        result.warnings.push(`[${stock.name}] 목록 밖 종목`);
-        passed = false;
-      } else if (stock.change && stock.change !== userStocks.get(stock.name)) {
-        result.warnings.push(`[${stock.name}] 수치 불일치`);
-        passed = false;
+    } else {
+      seenNames.add(stock.name);
+      
+      if (userStocks.size > 0 && !result.formatWarning) {
+        if (!userStocks.has(stock.name)) {
+          reason = "목록 밖 종목";
+          passed = false;
+        } else {
+          const expected = userStocks.get(stock.name);
+          if (expected.market !== stock.market) {
+            reason = `시장구분 불일치 (입력: ${expected.market})`;
+            passed = false;
+          } else {
+             const aiChange = normalizeChangeRate(stock.change);
+             if (aiChange !== null && Math.abs(aiChange - expected.changeNumber) > 0.01) {
+               reason = `수치 불일치 (입력: ${expected.changeNumber}%)`;
+               passed = false;
+             }
+          }
+        }
       }
     }
 
@@ -708,32 +744,33 @@ function validateReportData(jsonData, userInput) {
       const noEvidence = !evidence || evidence.includes('확인 불가');
       let hasKeywords = false;
       
-      if (!noEvidence && userInput) {
-        const cleanInput = (document.getElementById('moversInput').value + document.getElementById('newsInput').value).replace(/\s+/g, '');
-        const cleanEvidence = evidence.replace(/\s+/g, '');
+      if (!noEvidence && allEvidenceInput) {
+        // 공백 및 문장부호 제거, 소문자화로 느슨한 매칭
+        const cleanInput = allEvidenceInput.replace(/[\s\W_]+/g, '').toLowerCase();
+        const cleanEvidence = evidence.replace(/[\s\W_]+/g, '').toLowerCase();
         if (cleanEvidence.length > 0) {
-          if (cleanInput.includes(cleanEvidence) || (cleanEvidence.length > 3 && cleanInput.indexOf(cleanEvidence.substring(0, 10)) !== -1)) {
+          // 전체 포함되거나, 앞 15글자 이상 일치하면 통과
+          if (cleanInput.includes(cleanEvidence) || (cleanEvidence.length > 5 && cleanInput.includes(cleanEvidence.substring(0, 15)))) {
             hasKeywords = true;
           }
         }
       }
       
-      if (noEvidence || (!hasKeywords && userInput)) {
+      if (noEvidence || (!hasKeywords && allEvidenceInput)) {
         stock.derivative = null;
       }
     }
 
     if (passed) {
-      result.passed++;
-      validStocks.push(stock);
+      if (result.passedStocks.length < 20) {
+         result.passedStocks.push(stock);
+      } else {
+         result.excludedStocks.push({ name: stock.name, reason: "20개 초과" });
+      }
+    } else {
+      result.excludedStocks.push({ name: stock.name, reason });
     }
   });
-
-  if (stocks.length > 20) {
-    result.warnings.push(`종목 초과(${stocks.length})`);
-  }
-
-  jsonData.stock_analyses = validStocks;
 
   return result;
 }
@@ -745,11 +782,12 @@ function renderJsonToMarkdown(data, validation) {
     md += `> **⚠️ 형식 경고:** 입력된 특징주 데이터 형식을 파악하지 못해 세부 수치 검증을 건너뛰었습니다.\n\n`;
   }
   if (validation.total > 0) {
-    const totalExcluded = validation.total - validation.passed;
-    if (validation.warnings.length === 0) {
+    const totalExcluded = validation.excludedStocks.length;
+    if (totalExcluded === 0) {
       md += `> **✅ 검증 현황:** 분석된 ${validation.total}종목 모두 검증 통과 (안전)\n\n`;
     } else {
-      md += `> **⚠️ 검증 현황:** ${totalExcluded}종목 제외됨 / 사유: ${validation.warnings.join(', ')}\n\n`;
+      const warningMsgs = validation.excludedStocks.map(s => `${s.name} (${s.reason})`);
+      md += `> **⚠️ 검증 현황:** ${totalExcluded}종목 제외됨 / 사유: ${warningMsgs.join(', ')}\n\n`;
     }
   }
 
@@ -873,7 +911,14 @@ async function generateReport() {
       }
 
       const userMovers = document.getElementById('moversInput').value;
-      const validationResult = validateReportData(parsedData, userMovers);
+      const userNews = document.getElementById('newsInput').value;
+      const userSignal = document.getElementById('signalInput').value;
+      const allEvidenceInput = `${userMovers}\n${userNews}\n${userSignal}`;
+
+      const validationResult = validateReportData(parsedData, userMovers, allEvidenceInput);
+
+      // 검증 통과한 종목만 본문 렌더링에 사용 (검증 실패 종목 제외)
+      parsedData.stock_analyses = validationResult.passedStocks;
 
       currentMarkdown = renderJsonToMarkdown(parsedData, validationResult);
       
