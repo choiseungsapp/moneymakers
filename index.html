@@ -489,6 +489,14 @@
             </div>
         </div>
         <div class="field" style="margin-top: 16px;">
+          <label>오늘의 주도 섹터</label>
+          <textarea id="sectorsInput" placeholder="업종별 시세 기반 주도 섹터 정보" style="min-height: 60px;"></textarea>
+        </div>
+        <div class="field">
+          <label>주도주 후보 (시총상위)</label>
+          <textarea id="leadersInput" placeholder="시가총액 상위 종목 중 강세주 정보" style="min-height: 80px;"></textarea>
+        </div>
+        <div class="field">
           <label>주요 뉴스 (시장 흐름)</label>
           <textarea id="newsInput" placeholder="오늘 시장을 주도한 핵심 뉴스 2~3가지를 붙여넣어주세요. (각 뉴스 끝에 출처 URL 선택 입력)"></textarea>
         </div>
@@ -545,6 +553,7 @@ const SYSTEM_PROMPT = `너는 '머니메이커스(Money Makers)' 시황 데스�
 6. 매수/매도 추천, 목표가 제시, 수익 보장 표현은 엄격히 금지한다.
 
 [탑다운 분석 구조 — 보고서의 뼈대]
+- 0단계(주도 섹터/주도주): 입력된 [오늘의 주도 섹터]와 [주도주 후보 (시총상위)] 데이터를 기반으로 진짜 주도주와 강세 섹터를 짚어낸다. 상승률 TOP 30에 있는 상한가 잡주와 주도주를 명확히 분리한다.
 - 1단계(거시/뉴스): 입력된 뉴스·지표에서 오늘 시장을 움직인 핵심 동인을 짚고, 그 동인이 국내 증시·섹터의 자금을 어디로 흐르게 했는지까지 연결한다. 단순 요약에서 멈추지 않는다.
 - 2단계(테마): 그 동인에서 파생된 핵심 테마를 도출한다. 각 테마는 1단계의 뉴스/지표와 인과로 연결되어야 하며, 종목을 묶기 위한 빈 라벨을 만들지 않는다.
 - 3단계(종목): 각 종목은 반드시 2단계에서 정의한 테마 중 하나에 귀속시킨다(stock.theme 은 themes.name 중 하나와 정확히 일치해야 한다). 즉석에서 새 테마명을 만들지 않는다.
@@ -582,6 +591,22 @@ const SYSTEM_PROMPT = `너는 '머니메이커스(Money Makers)' 시황 데스�
       "insight": "다음 거래일 관전 포인트 중심의 머니메이커스 인사이트"
     }
   ],
+  "market_leaders": {
+    "leading_sectors": [
+      {
+        "name": "섹터명",
+        "reason": "업종 등락률 수치 등 근거"
+      }
+    ],
+    "leading_stocks": [
+      {
+        "name": "종목명",
+        "market": "KOSPI 또는 KOSDAQ",
+        "change": "등락률 (입력값 그대로, 예: +6.32%)",
+        "reason": "시총 상위 강세주 중 선정 이유"
+      }
+    ]
+  },
   "themes": [
     {
       "name": "테마명",
@@ -630,7 +655,7 @@ function init() {
   const savedModel = store.get('modelSelect');
   if(savedModel) document.getElementById('modelSelect').value = savedModel;
 
-  const fields = ['kospi', 'kosdaq', 'news', 'movers', 'signal'];
+  const fields = ['kospi', 'kosdaq', 'sectors', 'leaders', 'news', 'movers', 'signal'];
   fields.forEach(f => {
     const v = store.get(f);
     if(v) document.getElementById(f + 'Input').value = v;
@@ -668,6 +693,8 @@ function buildUserPrompt() {
   const date = document.getElementById('dateInput').value;
   const kospi = document.getElementById('kospiInput').value;
   const kosdaq = document.getElementById('kosdaqInput').value;
+  const sectors = document.getElementById('sectorsInput').value;
+  const leaders = document.getElementById('leadersInput').value;
   const news = document.getElementById('newsInput').value;
   const movers = document.getElementById('moversInput').value;
   const signal = document.getElementById('signalInput').value;
@@ -675,6 +702,8 @@ function buildUserPrompt() {
   let prompt = `[기준일: ${date}]\n`;
   if(kospi) prompt += `[KOSPI 등락률]: ${kospi}\n`;
   if(kosdaq) prompt += `[KOSDAQ 등락률]: ${kosdaq}\n`;
+  if(sectors) prompt += `\n[주도 섹터]\n${sectors}\n`;
+  if(leaders) prompt += `\n[주도주 후보]\n${leaders}\n`;
   if(news) prompt += `\n[주요 뉴스]\n${news}\n`;
   if(movers) prompt += `\n[특징주 / 상승률 TOP]\n${movers}\n`;
   if(signal) prompt += `\n[시그널리포트 / 기타]\n${signal}\n`;
@@ -735,6 +764,124 @@ function hasEvidenceSupport(evidence, sourceText) {
   return hits.length >= Math.min(2, keywords.length) || hits.some(keyword => keyword.length >= 3);
 }
 
+function validateReportData(jsonData, userInputMovers, userInputLeaders, allEvidenceInput) {
+  const result = {
+    totalLeaders: 0,
+    passedLeaders: [],
+    excludedLeaders: [],
+    totalMovers: 0,
+    passedMovers: [],
+    excludedMovers: [],
+    formatWarningMovers: false,
+    formatWarningLeaders: false
+  };
+
+  const userMoversMap = parseMoverRows(userInputMovers);
+  if (userMoversMap.size === 0 && userInputMovers.trim() !== '') {
+    result.formatWarningMovers = true;
+  }
+  
+  const userLeadersMap = parseMoverRows(userInputLeaders);
+  if (userLeadersMap.size === 0 && userInputLeaders.trim() !== '') {
+    result.formatWarningLeaders = true;
+  }
+
+  const validateStockList = (aiStocks, userMap, formatWarning, limit, passedList, excludedList, outOfListMsg) => {
+    if (!aiStocks || !Array.isArray(aiStocks)) return;
+    const seenNames = new Set();
+    
+    for (const stock of aiStocks) {
+      if (!formatWarning && passedList.length >= limit) {
+        excludedList.push({ name: stock.name, reason: `${limit}개 종목 제한 초과` });
+        continue;
+      }
+
+      let passed = true;
+      let reason = "";
+      
+      if (!formatWarning) {
+        if (stock.market !== 'KOSPI' && stock.market !== 'KOSDAQ') {
+          reason = "KOSPI/KOSDAQ 외 시장";
+          passed = false;
+        } else if (seenNames.has(stock.name)) {
+          reason = "중복 종목";
+          passed = false;
+        } else {
+          seenNames.add(stock.name);
+          if (userMap.size > 0) {
+            if (!userMap.has(stock.name)) {
+              reason = outOfListMsg;
+              passed = false;
+            } else {
+              const expected = userMap.get(stock.name);
+              if (expected.market !== stock.market) {
+                reason = `시장구분 불일치 (입력: ${expected.market})`;
+                passed = false;
+              } else {
+                 const aiChange = normalizeChangeRate(stock.change);
+                 if (aiChange !== null && Math.abs(aiChange - expected.changeNumber) > 0.01) {
+                   reason = `수치 불일치 (입력: ${expected.changeNumber}%)`;
+                   passed = false;
+                 }
+              }
+            }
+          }
+        }
+      }
+
+      if (stock.derivative && stock.derivative.name) {
+        const evidence = stock.derivative.evidence || "";
+        const noEvidence = !evidence || evidence.includes('확인 불가');
+        let hasKeywords = false;
+        if (!noEvidence && allEvidenceInput) {
+          hasKeywords = hasEvidenceSupport(evidence, allEvidenceInput);
+        }
+        if (noEvidence || (!hasKeywords && allEvidenceInput)) {
+          stock.derivative = null;
+        }
+      }
+
+      if (passed) {
+        if (passedList.length < limit) {
+           passedList.push(stock);
+        } else {
+           excludedList.push({ name: stock.name, reason: `${limit}개 초과` });
+        }
+      } else {
+        excludedList.push({ name: stock.name, reason });
+      }
+    }
+  };
+
+  if (jsonData.market_leaders && Array.isArray(jsonData.market_leaders.leading_stocks)) {
+    result.totalLeaders = jsonData.market_leaders.leading_stocks.length;
+    validateStockList(
+      jsonData.market_leaders.leading_stocks, 
+      userLeadersMap, 
+      result.formatWarningLeaders, 
+      12, // LEADER_N limit
+      result.passedLeaders, 
+      result.excludedLeaders, 
+      "주도주 후보 목록 밖"
+    );
+  }
+
+  if (jsonData.stock_analyses && Array.isArray(jsonData.stock_analyses)) {
+    result.totalMovers = jsonData.stock_analyses.length;
+    validateStockList(
+      jsonData.stock_analyses, 
+      userMoversMap, 
+      result.formatWarningMovers, 
+      20, 
+      result.passedMovers, 
+      result.excludedMovers, 
+      "상승률 TOP 30 목록 밖"
+    );
+  }
+
+  return result;
+}
+
 function handleFileUpload(e) {
   const file = e.target.files[0];
   if (!file) return;
@@ -749,7 +896,18 @@ function handleFileUpload(e) {
     const kosdaqMatch = text.match(/KOSDAQ\s*:\s*[^\(]+\(\s*([+-]?\d+(?:\.\d+)?)\s*%\s*\)/);
     if (kosdaqMatch) document.getElementById('kosdaqInput').value = (kosdaqMatch[1].startsWith('+') || kosdaqMatch[1].startsWith('-') ? '' : '+') + kosdaqMatch[1] + '%';
 
+    const sectorIdx = text.indexOf('[주도 섹터]');
+    const leaderIdx = text.indexOf('[주도주 후보]');
     const topIdx = text.indexOf('[상승률 TOP');
+    
+    if (sectorIdx !== -1 && leaderIdx !== -1) {
+      const sText = text.substring(sectorIdx, leaderIdx).replace('[주도 섹터]', '').replace('(네이버 업종별 등락률 기준)', '').trim();
+      document.getElementById('sectorsInput').value = sText;
+    }
+    if (leaderIdx !== -1 && topIdx !== -1) {
+      const lText = text.substring(leaderIdx, topIdx).replace('[주도주 후보]', '').replace('(시총 상위 50 중 강세, 등락률 내림차순)', '').trim();
+      document.getElementById('leadersInput').value = lText;
+    }
     if (topIdx !== -1) {
       const endIdx = text.indexOf('---', topIdx);
       const moversText = text.substring(topIdx, endIdx !== -1 ? endIdx : text.length);
@@ -759,6 +917,8 @@ function handleFileUpload(e) {
     
     store.set('kospi', document.getElementById('kospiInput').value);
     store.set('kosdaq', document.getElementById('kosdaqInput').value);
+    store.set('sectors', document.getElementById('sectorsInput').value);
+    store.set('leaders', document.getElementById('leadersInput').value);
     store.set('movers', document.getElementById('moversInput').value);
     showToast("파일에서 데이터를 성공적으로 불러왔습니다.");
   };
@@ -849,20 +1009,43 @@ function validateReportData(jsonData, userInput, allEvidenceInput) {
 function renderJsonToMarkdown(data, validation) {
   let md = '';
   
-  if (validation.formatWarning) {
-    md += `> **⚠️ 형식 경고:** 입력된 특징주 데이터 형식을 파악하지 못해 세부 수치 검증을 건너뛰었습니다.\n\n`;
+  if (validation.formatWarningMovers || validation.formatWarningLeaders) {
+    md += `> **⚠️ 형식 경고:** 데이터 형식을 파악하지 못해 일부 목록의 세부 수치 검증을 건너뛰었습니다.\n\n`;
   }
-  if (validation.total > 0) {
-    const totalExcluded = validation.excludedStocks.length;
-    if (totalExcluded === 0) {
-      md += `> **✅ 검증 현황:** 분석된 ${validation.total}종목 모두 검증 통과 (안전)\n\n`;
-    } else {
-      const warningMsgs = validation.excludedStocks.map(s => `${s.name} (${s.reason})`);
-      md += `> **⚠️ 검증 현황:** ${totalExcluded}종목 제외됨 / 사유: ${warningMsgs.join(', ')}\n\n`;
-    }
+  
+  const totalExcluded = validation.excludedLeaders.length + validation.excludedMovers.length;
+  md += `> **✅ 검증 현황:** 주도주 후보 ${validation.passedLeaders.length}종목 검증 통과 / 급등주 ${validation.passedMovers.length}종목 검증 통과 / 제외 ${totalExcluded}건\n`;
+  
+  if (totalExcluded > 0) {
+    md += `>\n`;
+    validation.excludedLeaders.forEach(s => {
+      md += `> **⚠️ 주도주 제외:** ${s.name} (${s.reason})\n`;
+    });
+    validation.excludedMovers.forEach(s => {
+      md += `> **⚠️ 급등주 제외:** ${s.name} (${s.reason})\n`;
+    });
   }
+  md += `\n`;
 
   md += `**[일일 보고서] ${data.report_date}: ${data.title}**\n\n`;
+
+  if (data.market_leaders) {
+    md += `■ 챕터 0: 오늘의 주도 섹터 & 진짜 주도주\n`;
+    if (data.market_leaders.leading_sectors && data.market_leaders.leading_sectors.length > 0) {
+      md += `**[주도 섹터]**\n`;
+      data.market_leaders.leading_sectors.forEach(s => {
+        md += `- **${s.name}**: ${s.reason}\n`;
+      });
+      md += `\n`;
+    }
+    if (data.market_leaders.leading_stocks && data.market_leaders.leading_stocks.length > 0) {
+      md += `**[진짜 주도주]** (테마주와 구별되는 우량 주도주)\n`;
+      data.market_leaders.leading_stocks.forEach(s => {
+        md += `- **${s.name}**: ${s.reason}\n`;
+      });
+      md += `\n`;
+    }
+  }
   
   md += `■ 챕터 1: 오늘의 빅뉴스 TOP ${data.big_news?.length || 0} (시장 흐름 읽기)\n`;
   data.big_news?.forEach((news, i) => {
@@ -983,14 +1166,18 @@ async function generateReport() {
       }
 
       const userMovers = document.getElementById('moversInput').value;
+      const userLeaders = document.getElementById('leadersInput').value;
       const userNews = document.getElementById('newsInput').value;
       const userSignal = document.getElementById('signalInput').value;
-      const allEvidenceInput = `${userMovers}\n${userNews}\n${userSignal}`;
+      const allEvidenceInput = `${userMovers}\n${userLeaders}\n${userNews}\n${userSignal}`;
 
-      const validationResult = validateReportData(parsedData, userMovers, allEvidenceInput);
+      const validationResult = validateReportData(parsedData, userMovers, userLeaders, allEvidenceInput);
 
       // 검증 통과한 종목만 본문 렌더링에 사용 (검증 실패 종목 제외)
-      parsedData.stock_analyses = validationResult.passedStocks;
+      if (parsedData.market_leaders && parsedData.market_leaders.leading_stocks) {
+        parsedData.market_leaders.leading_stocks = validationResult.passedLeaders;
+      }
+      parsedData.stock_analyses = validationResult.passedMovers;
 
       currentMarkdown = renderJsonToMarkdown(parsedData, validationResult);
       
