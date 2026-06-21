@@ -8,6 +8,7 @@
 <link rel="stylesheet" as="style" crossorigin
   href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css" />
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
 <style>
   :root {
     --bg-1: #0A0C10;
@@ -450,7 +451,7 @@
         <h3>1. 환경 설정</h3>
         <div class="field">
           <label>Gemini API Key</label>
-          <input type="password" id="apiKey" placeholder="AQ.Ab8... 등 API 키 입력" value="" />
+          <input type="password" id="apiKey" placeholder="Gemini API 키 입력" value="" />
           <div class="hint">API 키는 브라우저 로컬 스토리지에만 안전하게 저장됩니다. (Claude도 프롬프트는 적용 가능하나, 이 툴은 Gemini API 전용입니다.)</div>
         </div>
         <div class="field">
@@ -574,7 +575,8 @@ const SYSTEM_PROMPT = `너는 지금부터 '머니메이커스(Money Makers)'를
       "points": "오늘 왜 올랐는지 (구체적 모멘텀)",
       "derivative": {
         "name": "파생 종목명",
-        "reason": "관련 이유 및 엮이는 테마 설명 (인과 확인 불가 시 빈 문자열)"
+        "reason": "관련 이유 및 엮이는 테마 설명 (인과 확인 불가 시 빈 문자열)",
+        "evidence": "관련성을 입증할 수 있는 구체적인 근거 (없으면 빈 문자열)"
       }
     }
   ],
@@ -654,12 +656,28 @@ function buildUserPrompt() {
 }
 
 function validateReportData(jsonData, userInput) {
-  const result = { total: 0, passed: 0, warnings: [] };
+  const result = { total: 0, passed: 0, warnings: [], formatWarning: false };
   if (!jsonData.stock_analyses || !Array.isArray(jsonData.stock_analyses)) return result;
+
+  const userStocks = new Map();
+  if (userInput) {
+    const lines = userInput.split('\n');
+    const regex = /^\s*\d+\.\s+([^\s]+)\s*\(\s*(KOSPI|KOSDAQ)\s*\)\s*([-+]\d+\.\d+%)/;
+    for (const line of lines) {
+      const match = line.match(regex);
+      if (match) {
+        userStocks.set(match[1], match[3]);
+      }
+    }
+    if (userStocks.size === 0 && userInput.trim() !== '') {
+      result.formatWarning = true;
+    }
+  }
 
   const stocks = jsonData.stock_analyses;
   result.total = stocks.length;
   const seenNames = new Set();
+  const validStocks = [];
   
   stocks.forEach((stock) => {
     let passed = true;
@@ -675,26 +693,47 @@ function validateReportData(jsonData, userInput) {
     }
     seenNames.add(stock.name);
     
-    if (userInput && !userInput.includes(stock.name)) {
-      result.warnings.push(`[${stock.name}] 목록밖 종목`);
-      passed = false;
-    }
-    
-    if (userInput && stock.change && !userInput.includes(stock.change)) {
-      result.warnings.push(`[${stock.name}] 수치 불일치`);
-      passed = false;
-    }
-
-    if (stock.derivative && (!stock.derivative.reason || stock.derivative.reason.includes('확인 불가'))) {
-      stock.derivative = null;
+    if (userStocks.size > 0 && !result.formatWarning) {
+      if (!userStocks.has(stock.name)) {
+        result.warnings.push(`[${stock.name}] 목록 밖 종목`);
+        passed = false;
+      } else if (stock.change && stock.change !== userStocks.get(stock.name)) {
+        result.warnings.push(`[${stock.name}] 수치 불일치`);
+        passed = false;
+      }
     }
 
-    if (passed) result.passed++;
+    if (stock.derivative && stock.derivative.name) {
+      const evidence = stock.derivative.evidence || stock.derivative.reason || "";
+      const noEvidence = !evidence || evidence.includes('확인 불가');
+      let hasKeywords = false;
+      
+      if (!noEvidence && userInput) {
+        const cleanInput = (document.getElementById('moversInput').value + document.getElementById('newsInput').value).replace(/\s+/g, '');
+        const cleanEvidence = evidence.replace(/\s+/g, '');
+        if (cleanEvidence.length > 0) {
+          if (cleanInput.includes(cleanEvidence) || (cleanEvidence.length > 3 && cleanInput.indexOf(cleanEvidence.substring(0, 10)) !== -1)) {
+            hasKeywords = true;
+          }
+        }
+      }
+      
+      if (noEvidence || (!hasKeywords && userInput)) {
+        stock.derivative = null;
+      }
+    }
+
+    if (passed) {
+      result.passed++;
+      validStocks.push(stock);
+    }
   });
 
   if (stocks.length > 20) {
     result.warnings.push(`종목 초과(${stocks.length})`);
   }
+
+  jsonData.stock_analyses = validStocks;
 
   return result;
 }
@@ -702,11 +741,15 @@ function validateReportData(jsonData, userInput) {
 function renderJsonToMarkdown(data, validation) {
   let md = '';
   
+  if (validation.formatWarning) {
+    md += `> **⚠️ 형식 경고:** 입력된 특징주 데이터 형식을 파악하지 못해 세부 수치 검증을 건너뛰었습니다.\n\n`;
+  }
   if (validation.total > 0) {
+    const totalExcluded = validation.total - validation.passed;
     if (validation.warnings.length === 0) {
-      md += `> **✅ 검증 현황:** 통과 ${validation.passed} / ${validation.total} (안전)\n\n`;
+      md += `> **✅ 검증 현황:** 분석된 ${validation.total}종목 모두 검증 통과 (안전)\n\n`;
     } else {
-      md += `> **⚠️ 검증 현황:** 통과 ${validation.passed} / 경고 ${validation.warnings.length} (${validation.warnings.join(', ')})\n\n`;
+      md += `> **⚠️ 검증 현황:** ${totalExcluded}종목 제외됨 / 사유: ${validation.warnings.join(', ')}\n\n`;
     }
   }
 
@@ -766,6 +809,16 @@ async function generateReport() {
     return;
   }
 
+  const kospi = document.getElementById('kospiInput').value.trim();
+  const kosdaq = document.getElementById('kosdaqInput').value.trim();
+  const news = document.getElementById('newsInput').value.trim();
+  const movers = document.getElementById('moversInput').value.trim();
+
+  if (!kospi && !kosdaq && !news && !movers) {
+    alert("시황 정보(등락률, 뉴스, 특징주 등)를 하나 이상 입력해주세요.");
+    return;
+  }
+
   const model = document.getElementById('modelSelect').value;
   const btn = document.getElementById('generateBtn');
   
@@ -796,21 +849,42 @@ async function generateReport() {
       throw new Error(data.error?.message || 'API 호출에 실패했습니다.');
     }
 
-    if (data.candidates && data.candidates[0].content) {
-      const jsonString = data.candidates[0].content.parts[0].text;
-      const parsedData = JSON.parse(jsonString);
+    if (data.promptFeedback && data.promptFeedback.blockReason) {
+      throw new Error(`보안 필터에 의해 요청이 차단되었습니다. (사유: ${data.promptFeedback.blockReason})`);
+    }
+
+    if (data.candidates && data.candidates.length > 0) {
+      const candidate = data.candidates[0];
+      if (candidate.finishReason && candidate.finishReason !== 'STOP') {
+        throw new Error(`응답 생성이 중단되었습니다. (사유: ${candidate.finishReason})`);
+      }
+      
+      const parts = candidate.content?.parts;
+      if (!parts || parts.length === 0) {
+         throw new Error('응답 본문이 비어있습니다.');
+      }
+      
+      const jsonString = parts[0].text;
+      let parsedData;
+      try {
+        parsedData = JSON.parse(jsonString);
+      } catch (e) {
+        throw new Error('JSON 파싱 실패: AI 응답 형식이 올바르지 않습니다.');
+      }
 
       const userMovers = document.getElementById('moversInput').value;
       const validationResult = validateReportData(parsedData, userMovers);
 
       currentMarkdown = renderJsonToMarkdown(parsedData, validationResult);
       
-      // Render Markdown
+      // Render Markdown safely
       marked.setOptions({ breaks: true, gfm: true });
-      document.getElementById('reportContent').innerHTML = '<div class="markdown">' + marked.parse(currentMarkdown) + '</div>';
+      const rawHtml = marked.parse(currentMarkdown);
+      const safeHtml = DOMPurify.sanitize(rawHtml);
+      document.getElementById('reportContent').innerHTML = '<div class="markdown">' + safeHtml + '</div>';
       
       const now = new Date().toLocaleTimeString('ko-KR');
-      document.getElementById('reportMeta').textContent = \`마지막 생성: \${now} (\${model})\`;
+      document.getElementById('reportMeta').textContent = `마지막 생성: ${now} (${model})`;
       setStatus('Complete', false);
     } else {
       throw new Error('응답을 생성하지 못했습니다.');
@@ -843,7 +917,7 @@ function downloadReport() {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = \`머니메이커스_보고서_\${dateStr}.md\`;
+  a.download = `머니메이커스_보고서_${dateStr}.md`;
   a.click();
   URL.revokeObjectURL(url);
 }
